@@ -10,7 +10,25 @@
 -- 4) статус обработки (processing / completed / failed)
 -- 5) кэш ответа (status code + body)
 -- 6) timestamp'ы (created_at, updated_at, expires_at)
+CREATE TABLE idempotency_keys(
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    idempotency_key VARCHAR(255) NOT NULL,
+    request_method VARCHAR(16) NOT NULL,
+    request_path TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    status VARCHAR(32) NOT NULL DEFAULT 'processing',
+    status_code INTEGER,
+    response_body JSONB,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMP NOT NULL,
+    CONSTRAINT idempotency_status_check CHECK (status IN ('processing', 'completed', 'failed')),
+    CONSTRAINT unique_idempotency_key_endpoint UNIQUE (idempotency_key, request_method, request_path)
 
+);
+
+CREATE INDEX idx_idempotency_keys_expires_at ON idempotency_keys (expires_at);
+CREATE INDEX idx_idempotency_keys_lookup ON idempotency_keys (idempotency_key, request_method, request_path);
 -- Рекомендуемый каркас (можно изменить при обосновании):
 --
 -- CREATE TABLE idempotency_keys (
@@ -39,3 +57,4 @@
 
 -- TODO (опционально):
 -- триггер автообновления updated_at
+
