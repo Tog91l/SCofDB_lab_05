@@ -4,7 +4,8 @@ from typing import Callable
 
 from fastapi import Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware
-
+from starlette.responses import JSONResponse
+from app.infrastructure.redis_client import get_redis
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
     """
@@ -37,7 +38,33 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
            - X-RateLimit-Limit
            - X-RateLimit-Remaining
         """
+        path = request.url.path
 
-        # Заглушка: ограничение пока не применяется.
-        # TODO: заменить на полноценную реализацию.
-        return await call_next(request)
+        if not (path.endswith("/pay") or path.endswith("/retry-demo")):
+            return await call_next(request)
+        
+        user_id = request.headers.get("X-User-Id")
+
+        subject = user_id if user_id else (request.client.host if request.client else "unknown")
+
+        redis = get_redis()
+        key = f"rate_limit:pay:{subject}"
+        counter = await redis.incr(key)
+
+        if counter == 1:
+            await redis.expire(key, self.window_seconds)
+
+        remaining = max(self.limit_per_window - counter, 0)
+
+        if counter > self.limit_per_window:
+            return JSONResponse(status_code=429,content={"detail": "Too Many Requests"},
+                headers={"X-RateLimit-Limit": str(self.limit_per_window),"X-RateLimit-Remaining": "0", },
+            )
+
+    
+        response = await call_next(request)
+
+        response.headers["X-RateLimit-Limit"] = str(self.limit_per_window)
+        response.headers["X-RateLimit-Remaining"] = str(remaining)
+
+        return response
