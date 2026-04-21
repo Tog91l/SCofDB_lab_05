@@ -6,6 +6,9 @@ from typing import Callable
 
 from fastapi import Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware
+from app.infrastructure.db import SessionLocal
+from datetime import datetime, timedelta, UTC
+from sqlalchemy import text
 
 
 class IdempotencyMiddleware(BaseHTTPMiddleware):
@@ -46,10 +49,114 @@ class IdempotencyMiddleware(BaseHTTPMiddleware):
         - обработайте кейс конкурентных одинаковых ключей
           (уникальный индекс + retry/select existing).
         """
+        if request.method != "POST" or not request.url.path.startswith("/api/payments"):
+            return await call_next(request)
 
-        # Текущая заглушка: middleware ничего не меняет.
+        idempotency_key = request.headers.get("Idempotency-Key")
+        if not idempotency_key:
+            return await call_next(request)
+
+        body = await request.body()
+        request_hash = self.build_request_hash(body)
+
+
+        async with SessionLocal() as session:
+            async with session.begin():
+
+                result = await session.execute(
+                    text("""
+                        SELECT status, request_hash, status_code, response_body
+                        FROM idempotency_keys WHERE idempotency_key = :key
+                        AND request_method = :method AND request_path = :path FOR UPDATE"""),
+                    {
+                        "key": idempotency_key,
+                        "method": request.method,
+                        "path": request.url.path
+                    }
+                )
+
+                row = result.fetchone()
+
+                if row:
+                    status, stored_hash, status_code, stored_body = row
+
+                    if stored_hash != request_hash:
+                        return Response(
+                            status_code=409,
+                            content=json.dumps(
+                                {"error": "Idempotency key reused with different payload"}
+                            ),
+                            media_type="application/json"
+                        )
+
+                    if status == "completed":
+                        return Response(
+                            status_code=status_code,
+                            content=json.dumps(stored_body),
+                            headers={"X-Idempotency-Replayed": "true"},
+                            media_type="application/json"
+                        )
+
+                    if status == "processing":
+                        return Response(
+                            status_code=409,
+                            content=json.dumps({"error": "Request already processing"}),
+                            media_type="application/json"
+                        )
+
+                else:
+                
+                    expires_at = datetime.now(UTC) + timedelta(seconds=self.ttl_seconds)
+
+                    await session.execute(
+                    text(""" INSERT INTO idempotency_keys (idempotency_key, request_method, request_path, request_hash, status, expires_at)
+                            VALUES (:key, :method, :path, :hash, 'processing', :expires_at)"""),
+                            {
+                                "key": idempotency_key,
+                                "method": request.method,
+                                "path": request.url.path,
+                                "hash": request_hash,
+                                "expires_at": expires_at, }
+                                )
+
+        response = await call_next(request)
+
+        response_body_bytes = b""
+        async for chunk in response.body_iterator:
+            response_body_bytes += chunk
+
+        try:
+            response_body_json = json.loads(response_body_bytes.decode())
+        except Exception:
+            response_body_json = {"raw": response_body_bytes.decode()}
+
+        try:
+            async with SessionLocal() as session:
+                async with session.begin():
+                    await session.execute(
+                        text("""UPDATE idempotency_keys SET status = 'completed', status_code = :status_code, response_body = CAST(:response_body AS jsonb)
+                            WHERE idempotency_key = :key AND request_method = :method AND request_path = :path"""),
+                        {
+                            "status_code": response.status_code,
+                            "response_body": json.dumps(response_body_json),
+                            "key": idempotency_key,
+                            "method": request.method,
+                            "path": request.url.path,
+                        }
+                    )
+        except Exception:
+            pass
+
+        return Response(
+            content=response_body_bytes,
+            status_code=response.status_code,
+            headers=dict(response.headers),
+            media_type=response.media_type
+        )
+
+
+        
         # TODO: заменить на полноценную реализацию с БД.
-        return await call_next(request)
 
     @staticmethod
     def build_request_hash(raw_body: bytes) -> str:
@@ -60,3 +167,5 @@ class IdempotencyMiddleware(BaseHTTPMiddleware):
     def encode_response_payload(body_obj) -> str:
         """Сериализация response body для сохранения в idempotency_keys."""
         return json.dumps(body_obj, ensure_ascii=False)
+
+
